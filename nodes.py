@@ -1,72 +1,102 @@
 import os
 import glob
-from scenedetect import open_video, SceneManager, split_video_ffmpeg
+import cv2
+import numpy as np
+import torch
+from scenedetect import open_video, SceneManager, split_video_ffmpeg, FrameTimecode
 from scenedetect.detectors import ContentDetector
 from scenedetect.video_splitter import is_ffmpeg_available
 
-class SceneStartFramesNode:
-    def __init__(self):
-        pass
+# --- 修复后的内存视频流适配器 ---
+# --- 修复后的内存视频流适配器 (Version 4 - Final Fix) ---
+class TensorVideoStream:
+    """
+    适配器：ComfyUI Image Batch -> PySceneDetect VideoStream
+    修复了帧号偏移问题 (Off-by-One Error)
+    """
+    def __init__(self, images, fps=30.0):
+        self._images = images
+        self._fps = fps
+        self._total_frames = images.shape[0]
+        self._height = images.shape[1]
+        self._width = images.shape[2]
+        self.name = "Memory_Image_Batch"
+        
+        # _pos 指向"下一帧"的索引 (用于内部读取)
+        self._pos = 0
+        # _frame_number 指向"当前已读取帧"的索引 (用于外部报告)
+        # 初始化为 0，确保开始前状态正确
+        self._frame_number = 0
+        
+        self._base_timecode = FrameTimecode(timecode=0, fps=fps)
 
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "video_path": ("STRING", {"default": "input.mp4", "multiline": False}),
-                "threshold": ("FLOAT", {"default": 27.0, "min": 5.0, "max": 100.0, "step": 1.0, "display": "number"}),
-            },
-        }
+    @property
+    def frame_rate(self):
+        return self._fps
 
-    # 输出: 
-    # 1. start_frames_list: Python List [0, 145, 302...] (可传给自定义脚本或其他支持 List 的节点)
-    # 2. start_frames_str: 字符串 "0,145,302" (方便用于文本显示或复制)
-    # 3. count: 分镜总数量
-    RETURN_TYPES = ("LIST", "STRING", "INT")
-    RETURN_NAMES = ("start_frames_list", "start_frames_str", "count")
+    @property
+    def duration(self):
+        return FrameTimecode(timecode=self._total_frames, fps=self._fps)
+
+    @property
+    def frame_size(self):
+        return (self._width, self._height)
     
-    FUNCTION = "get_scene_frames"
-    CATEGORY = "Video/Automation"
+    @property
+    def aspect_ratio(self):
+        return 1.0
 
-    def get_scene_frames(self, video_path, threshold):
-        # 1. 基础检查
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Video file not found: {video_path}")
-        
-        # 2. 场景检测
-        print(f"[SceneFrames] Analyzing: {video_path}")
-        video = open_video(video_path)
-        scene_manager = SceneManager()
-        scene_manager.add_detector(ContentDetector(threshold=threshold))
-        
-        # 运行检测 (show_progress=False 以免在非切割模式下刷屏太快，可按需开启)
-        scene_manager.detect_scenes(video, show_progress=True)
-        scene_list = scene_manager.get_scene_list()
-        
-        # 3. 提取每一段的开始帧
-        # scene_list 的格式是 [(StartTimecode, EndTimecode), ...]
-        # 我们只需要 StartTimecode.get_frames()
-        start_frames = []
-        
-        if not scene_list:
-            # 如果没检测到变化，至少包含第0帧
-            print("[SceneFrames] No scene changes detected. Returning frame 0.")
-            start_frames = [0]
-        else:
-            start_frames = [scene[0].get_frames() for scene in scene_list]
+    @property
+    def base_timecode(self):
+        return self._base_timecode
 
-        # 确保第0帧一定存在（scenedetect通常会包含，但为了保险）
-        if 0 not in start_frames:
-            start_frames.insert(0, 0)
+    @property
+    def frame_number(self):
+        # [修复] 返回当前正在处理的帧号 (而不是下一帧)
+        return self._frame_number
+
+    @property
+    def position(self):
+        return FrameTimecode(timecode=self._frame_number, fps=self._fps)
+
+    def read(self, decode=True):
+        """
+        读取下一帧。
+        """
+        if self._pos >= self._total_frames:
+            return False
         
-        # 排序并去重
-        start_frames = sorted(list(set(start_frames)))
+        # [核心修复逻辑]
+        # 在读取开始时，将外部可见的 frame_number 更新为当前的 _pos
+        # 这样当 PySceneDetect 拿到帧后查询 frame_number 时，得到的是当前帧的 ID (比如 0)
+        self._frame_number = self._pos
+        
+        # 1. 取出 Tensor 帧
+        tensor_frame = self._images[self._pos]
+        
+        # 2. 转换数据
+        frame_numpy = (tensor_frame.cpu().numpy() * 255).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame_numpy, cv2.COLOR_RGB2BGR)
+        
+        # 3. 内部指针后移，指向下一帧
+        self._pos += 1
+        
+        return frame_bgr
 
-        print(f"[SceneFrames] Detected {len(start_frames)} scenes starting at frames: {start_frames}")
+    def seek(self, target):
+        if isinstance(target, (int, float)):
+            target = int(target)
+            self._pos = target
+            self._frame_number = target # 同步更新
+        elif isinstance(target, FrameTimecode):
+            self._pos = target.get_frames()
+            self._frame_number = self._pos
 
-        # 构造字符串输出
-        frames_str = ",".join(map(str, start_frames))
+    def reset(self):
+        self._pos = 0
+        self._frame_number = 0
 
-        return (start_frames, frames_str, len(start_frames))
+# --- 之前的切分节点 (保持不变) ---
 class SceneDetectSplitter:
     def __init__(self):
         pass
@@ -82,9 +112,6 @@ class SceneDetectSplitter:
             },
         }
 
-    # 定义输出类型：
-    # LIST: 原始的 Python 列表，包含所有切分后的文件绝对路径（方便传给支持 List 的自定义节点）
-    # STRING: 换行符分隔的字符串（方便用 ShowText 查看或传给文本处理）
     RETURN_TYPES = ("LIST", "STRING") 
     RETURN_NAMES = ("file_paths_list", "file_paths_str")
     
@@ -92,59 +119,113 @@ class SceneDetectSplitter:
     CATEGORY = "Video/Automation"
 
     def split_video(self, video_path, output_dir, threshold, show_progress):
-        # 1. 基础检查
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
         
         if not is_ffmpeg_available():
-            raise RuntimeError("FFmpeg is not installed or not in PATH. Please install FFmpeg.")
+            raise RuntimeError("FFmpeg is not installed or not in PATH.")
 
-        # 确保输出目录存在
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        # 2. 场景检测
         print(f"[SceneSplitter] Analyzing: {video_path}")
         video = open_video(video_path)
         scene_manager = SceneManager()
         scene_manager.add_detector(ContentDetector(threshold=threshold))
         
-        # 运行检测
         scene_manager.detect_scenes(video, show_progress=show_progress)
         scene_list = scene_manager.get_scene_list()
         
         print(f"[SceneSplitter] Detected {len(scene_list)} scenes.")
-        print(scene_list)
 
-        # 3. 如果没有检测到分镜（整个视频算一个），手动构造一个
         if not scene_list:
             print("[SceneSplitter] No scene changes detected. Using full video.")
-            # 这种情况下 split_video_ffmpeg 可能不工作，或者你可以选择不切分
-            # 这里我们为了逻辑闭环，如果不切分，直接返回原视频路径
             return ([video_path], video_path)
 
-        # 4. 执行切割
-        # split_video_ffmpeg 会根据 $VIDEO_NAME-Scene-$SCENE_NUMBER 格式命名
         print(f"[SceneSplitter] Splitting video into {output_dir}...")
         split_video_ffmpeg(video_path, scene_list, output_dir=output_dir, show_progress=show_progress)
 
-        # 5. 获取输出文件列表
-        # 逻辑：查找 output_dir 下，以视频文件名为前缀的所有视频文件
         video_name = os.path.splitext(os.path.basename(video_path))[0]
-        # 匹配模式：视频名-Scene-*.mp4/mkv/etc
-        # 注意：这里假设输出扩展名和原视频一致，scenedetect 通常是这样的
         ext = os.path.splitext(video_path)[1]
         search_pattern = os.path.join(output_dir, f"{video_name}-Scene-*{ext}")
-        
-        # 获取文件列表并排序
         generated_files = sorted(glob.glob(search_pattern))
-        
-        # 转换为绝对路径
         abs_generated_files = [os.path.abspath(f) for f in generated_files]
-        
-        # 构造换行分隔的字符串
         paths_str = "\n".join(abs_generated_files)
-
-        print(f"[SceneSplitter] Done! Generated {len(abs_generated_files)} clips.")
         
         return (abs_generated_files, paths_str)
+
+
+# --- 更新后的获取帧节点 (保持逻辑不变) ---
+class SceneStartFramesNode:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "threshold": ("FLOAT", {"default": 27.0, "min": 5.0, "max": 100.0, "step": 1.0, "display": "number"}),
+            },
+            "optional": {
+                "images": ("IMAGE",), 
+                "video_path": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("LIST", "STRING", "INT")
+    RETURN_NAMES = ("start_frames_list", "start_frames_str", "count")
+    
+    FUNCTION = "get_scene_frames"
+    CATEGORY = "Video/Automation"
+
+    def get_scene_frames(self, threshold, images=None, video_path=""):
+        video_stream = None
+        source_name = ""
+
+        # --- 1. 优先级逻辑 ---
+        if images is not None:
+            print(f"[SceneFrames] Input: Image Batch detected ({images.shape[0]} frames). Using images.")
+            # 使用修复后的适配器
+            video_stream = TensorVideoStream(images, fps=30.0) 
+            source_name = "Memory_Batch"
+
+        elif video_path and os.path.exists(video_path):
+            print(f"[SceneFrames] Input: Video file detected ({video_path}).")
+            video_stream = open_video(video_path)
+            source_name = os.path.basename(video_path)
+            
+        else:
+            raise ValueError("[SceneFrames] Error: Please provide either 'images' input OR a valid 'video_path'.")
+
+        # --- 2. 执行检测 ---
+        print(f"[SceneFrames] Analyzing source: {source_name} ...")
+        
+        try:
+            scene_manager = SceneManager()
+            scene_manager.add_detector(ContentDetector(threshold=threshold))
+            
+            scene_manager.detect_scenes(video_stream, show_progress=True)
+            scene_list = scene_manager.get_scene_list()
+            
+            # --- 3. 提取结果 ---
+            start_frames = []
+            if not scene_list:
+                print("[SceneFrames] No scene changes detected. Defaulting to frame 0.")
+                start_frames = [0]
+            else:
+                start_frames = [scene[0].get_frames() for scene in scene_list]
+
+            if 0 not in start_frames:
+                start_frames.insert(0, 0)
+            
+            start_frames = sorted(list(set(start_frames)))
+            
+            print(f"[SceneFrames] Detect Success. Scenes start at: {start_frames}")
+            
+            frames_str = ",".join(map(str, start_frames))
+
+            return (start_frames, frames_str, len(start_frames))
+            
+        except Exception as e:
+            print(f"[SceneFrames] Detection failed: {e}")
+            raise e
